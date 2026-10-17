@@ -35,6 +35,9 @@ it pops.
 - **Optionally targets it.** Once the mob is in range, pop can put your cursor
   on it, either by sending the game's `/target` command or by injecting the
   client-side lock-on packet for an exact match.
+- **Optionally claims it.** With targeting on, pop can also use a spell or job
+  ability of your choice on the targeted mob while it is unclaimed and within
+  range, such as `Dia` or `Provoke`, and stops as soon as anyone claims it.
 - **Knows when it is over.** Tracking ends when the mob dies in front of you,
   when the client drops the Wide Scan track, or (with tracking off) when the
   mob disappears from the scan results. With looping enabled, the search then
@@ -107,7 +110,8 @@ one.
 | `//pop status_delay [n]` | seconds | `1` | Time between checks of a found mob: the status report and targeting while tracked, and the rescans that wait for it to die or despawn. |
 | `//pop timeout [n]` | seconds | `5` | How long to wait for the server to finish sending a Wide Scan list before the search ends with an error. |
 | `//pop track [on\|off]` | boolean | `on` | Wide Scan track the found mob and report its distance, HP, and claim whenever they change. When off, pop only announces the find and keeps scanning until the mob is gone. |
-| `//pop target [off\|packet\|command]` | choice | `off` | How to put your cursor on the mob once it is in range. `command` sends `/target <name>`; `packet` injects the client-side lock-on packet, which selects the exact entity. Independent of `track`. |
+| `//pop target [off\|packet\|command]` | choice | `off` | How to put your cursor on the mob once it is in range. `command` sends `/target <name>`; `packet` injects the client-side lock-on packet, which selects the exact entity. Independent of `track`. Turning this off also turns `claim` off. |
+| `//pop claim [off\|<name>]` | spell or ability name | `off` | Once the mob is targeted, use this spell or job ability on it while it is unclaimed. The name is looked up in the game's spell and ability lists, so `dia` and `"Dia"` both work; the right slash command is picked for you. Refused while `target` is `off`. |
 | `//pop loop [on\|off]` | boolean | `on` | After the found mob dies or despawns, start the whole search over for the same list. When off, pop is done after one spawn. |
 
 ### Display and sound settings
@@ -137,6 +141,9 @@ after editing it by hand.
 | `timeout` | number | `5` | See `//pop timeout`. |
 | `track` | boolean | `true` | See `//pop track`. |
 | `target` | string | `off` | `off`, `packet`, or `command`. See `//pop target`. |
+| `claim.action` | string | `off` | `off`, or the English name of a spell or job ability. See `//pop claim`. Ignored, with a warning on load, if `target` is `off` or the name is unknown. |
+| `claim.range` | number | `20` | Only try to claim while the mob is within this many yalms. Most spells reach about 20; many abilities less. |
+| `claim.retry` | number | `5` | Seconds to wait after a claim attempt before trying again, so a cast in progress or a miss is not spammed. |
 | `loop` | boolean | `true` | See `//pop loop`. |
 
 ### Display and sound
@@ -176,6 +183,12 @@ A color is a block with `red`, `green`, `blue`, and `alpha`, each 0 to 255.
 - Everything pop does with Wide Scan goes through the same requests the game
   itself makes. The `packet` targeting mode is the one exception: it feeds the
   client a lock-on packet locally and sends nothing to the server.
+- Claiming types the action into the chat line as `/ma "Dia" <t>` or
+  `/ja "Provoke" <t>`, exactly as you would. It only fires while the mob is
+  your current target, alive, unclaimed, and inside `claim.range`, and never
+  more than once per `claim.retry` seconds. pop does not check that your
+  current job can use the action or that it is off recast; the game reports
+  those as usual.
 - The chime and beep are small generated WAVs. Replace the files in `sounds/`,
   or drop in others and point `alert.file` or `countdown.sound.file` at them,
   if you prefer different noises.

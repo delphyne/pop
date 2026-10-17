@@ -6,6 +6,7 @@ _addon.command = 'pop'
 require('logger')
 local config = require('config')
 local packets = require('packets')
+local res = require('resources')
 local texts = require('texts')
 
 local defaults = {
@@ -29,6 +30,12 @@ local defaults = {
     --   'packet'  - inject the client-side Lock Target packet (exact entity)
     --   'command' - send the game's /target <name> command
     target = 'off',
+    -- How the found mob is claimed once it is targeted and unclaimed. Needs
+    -- target on; //pop claim refuses otherwise.
+    --   action - 'off', or the English name of a spell or job ability to use on it
+    --   range  - only try while the mob is within this many yalms
+    --   retry  - seconds to wait after an attempt before trying again
+    claim = {action = 'off', range = 20, retry = 5},
     -- When true, once a found mob is gone (dead or despawned) the whole search
     -- starts over for the same list of mobs. When false, the search is done.
     loop = true,
@@ -251,6 +258,8 @@ Settings (name alone shows the value; add a value to set it):
   timeout <n>             Seconds to wait for a widescan before giving up (default 5).
   track on|off            Widescan-track the found mob and report distance/HP/claim.
   target off|packet|command  Target the mob in range: lock-on packet, or /target.
+  claim off|<name>        Use that spell or job ability on the targeted mob while it
+                          is unclaimed (needs target on).
   loop on|off             Search again after the found mob dies or despawns.
   timer on|off|reset      Show the on-screen timer; reset re-centers it.
   alert on|off            Chime when a mob is found.
@@ -269,6 +278,10 @@ local scan_serial = 0
 -- by the widescan track packet (incoming 0x0F5), which works at any range.
 local tracked_index
 local tracked_pos
+-- Resource entry for settings.claim.action; nil when claiming is off.
+local claim_action
+-- os.time() of the last claim attempt, so attempts are spaced claim.retry apart.
+local last_claim_attempt = 0
 
 --------------------------------------------------------------------------------
 -- Search and track routine (runs inside a coroutine)
@@ -376,6 +389,7 @@ local function track_first_match(queries)
             end
             timer_freeze()
             play_found_sound()
+            last_claim_attempt = 0
             return found[1]
         elseif #found > 1 then
             -- A name that fits several mobs is not one mob, so any index it
@@ -456,35 +470,98 @@ local function status_line(found, seen_alive)
     return '%s: %s':format(label(found), table.concat(parts, ' | '))
 end
 
--- Make the client target the mob by injecting the Lock Target packet the
--- server would send. Only possible while the entity is loaded client-side.
+-- Put the cursor on the mob, per settings.target: send /target, or inject the
+-- Lock Target packet the server would send. Only possible while the entity is
+-- loaded client-side. Returns true when the mob is already the current target.
 local function target_mob(index)
     if settings.target == 'off' then
-        return
+        return false
     end
     local mob = windower.ffxi.get_mob_by_index(index)
     if not mob or not mob.valid_target or is_dead(mob) then
-        return
+        return false
     end
     local current = windower.ffxi.get_mob_by_target('t')
     if current and current.index == index then
-        return
+        return true
     end
 
     if settings.target == 'command' then
         windower.send_command('input /target %s':format(mob.name))
-        return
+        return false
     end
 
     local me = windower.ffxi.get_mob_by_target('me')
     if not me then
-        return
+        return false
     end
     packets.inject(packets.new('incoming', 0x058, {
         ['Player'] = me.id,
         ['Target'] = mob.id,
         ['Player Index'] = me.index,
     }))
+    return false
+end
+
+-- The spell or job ability resource entry called `name`, ignoring case; nil if
+-- there is none.
+local function find_action(name)
+    name = name:lower()
+    for _, list in ipairs({res.spells, res.job_abilities}) do
+        for _, entry in pairs(list) do
+            if entry.english:lower() == name then
+                return entry
+            end
+        end
+    end
+    return nil
+end
+
+-- Look up the configured claim action. Returns an error message when the
+-- setting cannot be used as it stands, in which case claiming is left off.
+local function resolve_claim_action()
+    claim_action = nil
+    local name = settings.claim.action
+    if not name or name == '' or name:lower() == 'off' then
+        return nil
+    end
+    if settings.target == 'off' then
+        return 'claim is set to %s but target is off; claiming disabled.':format(name)
+    end
+    claim_action = find_action(name)
+    if not claim_action then
+        return 'No spell or job ability called "%s"; claiming disabled.':format(name)
+    end
+    return nil
+end
+
+-- Use the claim action on the mob, which must be the current target. Does
+-- nothing while the mob is claimed (by anyone), dead, out of claim.range, or
+-- within claim.retry seconds of the last attempt.
+local function claim_mob(index)
+    if not claim_action then
+        return
+    end
+    local mob = windower.ffxi.get_mob_by_index(index)
+    if not mob or not mob.valid_target or is_dead(mob) or mob.claim_id ~= 0 then
+        return
+    end
+    if math.sqrt(mob.distance) > settings.claim.range then
+        return
+    end
+    if os.time() - last_claim_attempt < settings.claim.retry then
+        return
+    end
+    last_claim_attempt = os.time()
+    log('Claiming %s with %s.':format(mob.name, claim_action.english))
+    windower.send_command('input %s "%s" <t>':format(claim_action.prefix, claim_action.english))
+end
+
+-- Target the mob and, once the cursor is on it, try to claim it.
+local function target_and_claim(index)
+    if target_mob(index) then
+        claim_mob(index)
+    end
 end
 
 local function end_tracking(reason)
@@ -529,7 +606,7 @@ local function monitor(mob)
             return
         end
 
-        target_mob(mob.Index)
+        target_and_claim(mob.Index)
         coroutine.yield('retry', settings.status_delay)
     end
 end
@@ -564,7 +641,7 @@ local function watch(mob, quiet)
             end
             return true
         end
-        target_mob(mob.Index)
+        target_and_claim(mob.Index)
     end
 end
 
@@ -821,9 +898,46 @@ local function show_or_set_choice(key, value)
             return
         end
         settings[key] = value
+        -- Claiming needs a target, so turning targeting off turns it off too.
+        if key == 'target' and value == 'off' and claim_action then
+            settings.claim.action = 'off'
+            claim_action = nil
+            log('Claiming turned off: it needs targeting.')
+        end
         config.save(settings)
     end
     log('%s: %s':format(description, settings[key]))
+end
+
+-- Show the claim action, or set and save it when a value is given. `off`
+-- disables claiming; anything else must name a spell or job ability, and
+-- targeting must be on.
+local function show_or_set_claim(value)
+    if value then
+        if value:lower() == 'off' then
+            settings.claim.action = 'off'
+            claim_action = nil
+        else
+            if settings.target == 'off' then
+                error('claim needs targeting; set //pop target packet or command first.')
+                return
+            end
+            local action = find_action(value)
+            if not action then
+                error('No spell or job ability called "%s".':format(value))
+                return
+            end
+            settings.claim.action = action.english
+            claim_action = action
+        end
+        config.save(settings)
+    end
+    if claim_action then
+        log('Claiming with: %s (%s), within %g yalms, retrying every %gs.':format(
+            claim_action.english, claim_action.prefix, settings.claim.range, settings.claim.retry))
+    else
+        log('Claiming: off')
+    end
 end
 
 -- Numeric settings adjustable from the command line: key -> description.
@@ -865,6 +979,9 @@ windower.register_event('addon command', function(...)
         show_or_set_bool(cmd, args[2])
     elseif choice_settings[cmd] then
         show_or_set_choice(cmd, args[2])
+    elseif cmd == 'claim' then
+        -- Join the rest so an unquoted multi-word name still works.
+        show_or_set_claim(args[2] and table.concat(args, ' ', 2))
     elseif cmd == 'timer' then
         local value = args[2] and args[2]:lower()
         if value == 'reset' then
@@ -902,6 +1019,13 @@ windower.register_event('addon command', function(...)
             queries[i] = index and {index = index} or {name = arg:lower()}
         end
         start_tracking(queries)
+    end
+end)
+
+windower.register_event('load', function()
+    local problem = resolve_claim_action()
+    if problem then
+        warning(problem)
     end
 end)
 
