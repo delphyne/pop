@@ -426,6 +426,14 @@ local function stop_tracking()
     windower.ffxi.wide_scan_stop_tracking()
 end
 
+-- Widescan state does not survive a zone change, so neither does ours.
+windower.register_event('zone change', function()
+    if tracker then
+        stop_tracking()
+        log('Zoned; stopped.')
+    end
+end)
+
 --------------------------------------------------------------------------------
 -- Packet handling
 --------------------------------------------------------------------------------
