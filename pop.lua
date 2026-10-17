@@ -313,9 +313,12 @@ end
 
 -- Track-off counterpart of monitor: rescan every settings.delay seconds and
 -- return once the mob has left the widescan results (dead or despawned).
--- Returns false if a scan timed out, so the caller stops.
-local function watch(mob)
-    log('Waiting for %s to die or despawn.':format(mob.Name))
+-- Returns false if a scan timed out, so the caller stops. With `quiet`, logs
+-- nothing (used to wait out a corpse after the monitor already reported it).
+local function watch(mob, quiet)
+    if not quiet then
+        log('Waiting for %s to die or despawn.':format(mob.Name))
+    end
     while true do
         coroutine.yield('retry')
         request_scan()
@@ -324,7 +327,9 @@ local function watch(mob)
             return false
         end
         if not in_scan(mob.Index) then
-            log('%s is gone (dead or despawned).':format(mob.Name))
+            if not quiet then
+                log('%s is gone (dead or despawned).':format(mob.Name))
+            end
             return true
         end
         target_mob(mob.Index)
@@ -353,7 +358,10 @@ local function search_and_track(queries)
             local gone
             if settings.track then
                 monitor(mob)
-                gone = true
+                -- A dead mob stays in widescan results until its corpse
+                -- despawns; wait for that or the restarted search would
+                -- find and alert on it again.
+                gone = not settings.loop or watch(mob, true)
             else
                 gone = watch(mob)
             end
