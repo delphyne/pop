@@ -9,24 +9,31 @@ local packets = require('packets')
 
 local defaults = {
     -- Seconds between widescan attempts while the target has not been found.
-    delay = 5,
+    delay = 1,
     -- Seconds to wait for the server to finish sending a widescan list before giving up.
     timeout = 5,
     -- WAV file in the addon's sounds/ directory to play when a mob is tracked. Empty disables.
     sound = 'found.wav',
-    -- When true, no sound is played. Set with //pop mute and //pop unmute.
-    muted = false,
-    -- When true, a found mob is widescan-tracked, targeted and its status
-    -- reported. When false, the addon only scans and announces the find.
+    -- When true, the sound is played when a mob is found. Set with //pop alert on|off.
+    alert = true,
+    -- When true, a found mob is widescan-tracked and its distance, HP and
+    -- claim status reported. When false, the addon only scans and announces
+    -- the find, then rescans until the mob is gone.
     track = true,
+    -- How the found mob is targeted (while in range) every delay seconds
+    -- until it is gone. Independent of track.
+    --   'off'     - never
+    --   'packet'  - inject the client-side Lock Target packet (exact entity)
+    --   'command' - send the game's /target <name> command
+    target = 'off',
     -- When true, once a found mob is gone (dead or despawned) the whole search
     -- starts over for the same list of mobs. When false, the search is done.
-    loop = false,
+    loop = true,
 }
 local settings = config.load(defaults)
 
 local function play_found_sound()
-    if settings.muted or settings.sound == '' then
+    if not settings.alert or settings.sound == '' then
         return
     end
     local path = windower.addon_path .. 'sounds/' .. settings.sound
@@ -47,17 +54,16 @@ local help_text = [[pop usage:
                         Scanning repeats every <delay> seconds until a mob is found or stopped.
     //pop delay [n]   - Show or set the seconds between scans.
     //pop timeout [n] - Show or set the seconds to wait for a scan to complete.
-    //pop track [on|off] - Show or set whether a found mob is tracked, targeted and
-                        monitored (on), or only announced (off).
+    //pop track [on|off] - Show or set whether a found mob is widescan-tracked with its
+                        distance, HP and claim reported on change (on), or only announced (off).
+    //pop target [off|packet|command] - Show or set how a found mob is targeted (when in
+                        range) every <delay> seconds until it is gone. Independent of track.
+                        packet injects a client-side lock-on; command sends /target <name>.
     //pop loop [on|off] - Show or set whether, after a found mob dies or despawns,
                         the search restarts for the same list (on) or finishes (off).
-    //pop mute        - Silence the sound played when a mob is found.
-    //pop unmute      - Restore the sound played when a mob is found.
+    //pop alert [on|off] - Show or set whether a sound is played when a mob is found.
     //pop stop        - Stop searching/tracking.
-    //pop help        - Show this text.
-
-Once a mob is tracked, its distance, HP and claim status are reported whenever they
-change, and it is targeted (when in range) every <delay> seconds until //pop stop.]]
+    //pop help        - Show this text.]]
 
 -- Mobs reported by the server during the current widescan (incoming 0x0F4).
 local scan_list = {}
@@ -221,6 +227,9 @@ end
 -- Make the client target the mob by injecting the Lock Target packet the
 -- server would send. Only possible while the entity is loaded client-side.
 local function target_mob(index)
+    if settings.target == 'off' then
+        return
+    end
     local mob = windower.ffxi.get_mob_by_index(index)
     if not mob or not mob.valid_target or is_dead(mob) then
         return
@@ -229,6 +238,12 @@ local function target_mob(index)
     if current and current.index == index then
         return
     end
+
+    if settings.target == 'command' then
+        windower.send_command('input /target %s':format(mob.name))
+        return
+    end
+
     local me = windower.ffxi.get_mob_by_target('me')
     if not me then
         return
@@ -240,9 +255,6 @@ local function target_mob(index)
     }))
 end
 
--- Runs inside the tracker coroutine after a mob has been tracked: report
--- changes and (re)target it every settings.delay seconds until it dies or
--- tracking is stopped.
 local function end_tracking(reason)
     log(reason)
     tracked_index = nil
@@ -250,7 +262,9 @@ local function end_tracking(reason)
     windower.ffxi.wide_scan_stop_tracking()
 end
 
--- Returns when the mob dies or the client drops the widescan track (the mob
+-- Runs inside the tracker coroutine after a mob has been widescan-tracked:
+-- report status changes (and target it, if enabled) every settings.delay
+-- seconds. Returns when the mob dies or the client drops the track (the mob
 -- died or despawned out of entity range, or the track was otherwise lost).
 local function monitor(mob)
     local last_line
@@ -313,6 +327,7 @@ local function watch(mob)
             log('%s is gone (dead or despawned).':format(mob.Name))
             return true
         end
+        target_mob(mob.Index)
     end
 end
 
@@ -490,7 +505,8 @@ end
 -- Boolean settings adjustable from the command line: key -> description.
 local bool_settings = {
     track = 'Tracking after a find',
-    loop = 'Looping after a track ends',
+    loop = 'Looping after a find is gone',
+    alert = 'Sound on a find',
 }
 
 -- Show the setting, or set and save it when a value is given.
@@ -505,6 +521,30 @@ local function show_or_set_bool(key, value)
         config.save(settings)
     end
     log('%s: %s':format(bool_settings[key], settings[key] and 'on' or 'off'))
+end
+
+-- Multiple-choice settings: key -> {description, allowed values in order}.
+local choice_settings = {
+    target = {'Targeting after a find', {'off', 'packet', 'command'}},
+}
+
+-- Show the setting, or set and save it when a value is given.
+local function show_or_set_choice(key, value)
+    local description, choices = unpack(choice_settings[key])
+    if value then
+        value = value:lower()
+        local valid = false
+        for _, choice in ipairs(choices) do
+            valid = valid or choice == value
+        end
+        if not valid then
+            error('%s expects one of: %s':format(key, table.concat(choices, ', ')))
+            return
+        end
+        settings[key] = value
+        config.save(settings)
+    end
+    log('%s: %s':format(description, settings[key]))
 end
 
 -- Numeric settings adjustable from the command line: key -> description.
@@ -540,10 +580,8 @@ windower.register_event('addon command', function(...)
         show_or_set(cmd, args[2])
     elseif bool_settings[cmd] then
         show_or_set_bool(cmd, args[2])
-    elseif cmd == 'mute' or cmd == 'unmute' then
-        settings.muted = cmd == 'mute'
-        config.save(settings)
-        log(settings.muted and 'Sound muted.' or 'Sound unmuted.')
+    elseif choice_settings[cmd] then
+        show_or_set_choice(cmd, args[2])
     else
         -- Each remaining argument is a target, in priority order. An argument with
         -- the 0x prefix is an index; anything else is a (wildcard) name. Names
