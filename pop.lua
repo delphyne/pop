@@ -287,7 +287,9 @@ end
 -- A query is either {index = <number>} or {name = <lowercase wildcard pattern>}.
 -- Once the other half of the mob's identity is known (the name of an index, or
 -- the index of a name), it is stored in query.known = {Index, Name} and every
--- message about the query shows both instead of what the user typed.
+-- message about the query shows both instead of what the user typed. Matching
+-- always uses what the user typed; `known` is only for display, and a name
+-- query loses it again if the name turns out to fit more than one mob.
 local function describe(query)
     if query.known then
         return label(query.known)
@@ -376,6 +378,10 @@ local function track_first_match(queries)
             play_found_sound()
             return found[1]
         elseif #found > 1 then
+            -- A name that fits several mobs is not one mob, so any index it
+            -- picked up from an earlier single match no longer identifies it.
+            -- Only name queries can get here; an index matches at most once.
+            query.known = nil
             log('Multiple matches for %s; retry with an index:':format(describe(query)))
             table.sort(found, function(a, b)
                 return a.Index < b.Index

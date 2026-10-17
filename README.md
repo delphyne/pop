@@ -91,7 +91,9 @@ Whatever form you give, pop fills in the other half as soon as it can. An
 index is named from the zone's entity table, usually at the start of the
 search; a name or wildcard gets its index when the mob is first found. From
 then on every message about that target, including the looped restart, shows
-it as `Mob Name [0x00F8]` rather than what you typed.
+it as `Mob Name [0x00F8]` rather than what you typed. This is only for
+display: a name is always searched as a name, and if it ever matches more
+than one mob the remembered index is dropped.
 
 When a name pattern matches more than one mob in a scan, pop lists the
 candidates with their indexes and stops so you can rerun it with the exact
