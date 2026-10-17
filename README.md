@@ -87,6 +87,12 @@ Indexes must carry the `0x` prefix. That keeps names that happen to look like
 hex, such as `beef`, from being read as numbers. A bare trailing number is
 always read as the expected pop time, never as a name.
 
+Whatever form you give, pop fills in the other half as soon as it can. An
+index is named from the zone's entity table, usually at the start of the
+search; a name or wildcard gets its index when the mob is first found. From
+then on every message about that target, including the looped restart, shows
+it as `Mob Name [0x00F8]` rather than what you typed.
+
 When a name pattern matches more than one mob in a scan, pop lists the
 candidates with their indexes and stops so you can rerun it with the exact
 one.

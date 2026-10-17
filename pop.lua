@@ -279,12 +279,43 @@ local tracked_pos
 -- It is resumed with 'results' when the list arrived, or 'timeout' if it did not.
 --------------------------------------------------------------------------------
 
+-- 'Name [0xIIII]' for a table with Name and Index fields.
+local function label(mob)
+    return '%s [0x%04X]':format(mob.Name, mob.Index)
+end
+
 -- A query is either {index = <number>} or {name = <lowercase wildcard pattern>}.
+-- Once the other half of the mob's identity is known (the name of an index, or
+-- the index of a name), it is stored in query.known = {Index, Name} and every
+-- message about the query shows both instead of what the user typed.
 local function describe(query)
-    if query.index then
+    if query.known then
+        return label(query.known)
+    elseif query.index then
         return '0x%04X':format(query.index)
     end
     return query.name
+end
+
+local function learn(query, index, name)
+    if not query.known and name and name ~= '?' then
+        query.known = {Index = index, Name = name}
+    end
+end
+
+-- Name index queries from the client's entity table, which carries the names
+-- of the zone's mobs whether or not they are spawned or in range.
+local function resolve_indices(queries)
+    local mob_list
+    for _, query in ipairs(queries) do
+        if query.index and not query.known then
+            mob_list = mob_list or windower.ffxi.get_mob_list()
+            local name = mob_list[query.index]
+            if name and name ~= '' then
+                learn(query, query.index, name)
+            end
+        end
+    end
 end
 
 local function matches(query, mob, name)
@@ -332,13 +363,14 @@ local function track_first_match(queries)
         local found = find_matches(query)
 
         if #found == 1 then
+            learn(query, found[1].Index, found[1].Name)
             if settings.track then
-                log('Tracking: %s [0x%04X]':format(found[1].Name, found[1].Index))
+                log('Tracking: %s':format(label(found[1])))
                 tracked_index = found[1].Index
                 tracked_pos = nil
                 windower.ffxi.wide_scan_track_index(found[1].Index)
             else
-                log('Found: %s [0x%04X]':format(found[1].Name, found[1].Index))
+                log('Found: %s':format(label(found[1])))
             end
             timer_freeze()
             play_found_sound()
@@ -398,7 +430,8 @@ local function claim_text(mob)
 end
 
 -- One-line status for the tracked mob. Only changes in this string are logged.
-local function status_line(index, name, seen_alive)
+local function status_line(found, seen_alive)
+    local index = found.Index
     local mob = windower.ffxi.get_mob_by_index(index)
     local distance = distance_to(mob)
     local parts = {}
@@ -414,7 +447,7 @@ local function status_line(index, name, seen_alive)
         parts[#parts + 1] = 'out of range'
     end
 
-    return '%s: %s':format(name, table.concat(parts, ' | '))
+    return '%s: %s':format(label(found), table.concat(parts, ' | '))
 end
 
 -- Make the client target the mob by injecting the Lock Target packet the
@@ -472,21 +505,21 @@ local function monitor(mob)
             seen_alive = true
         end
 
-        local line = status_line(mob.Index, mob.Name, seen_alive)
+        local line = status_line(mob, seen_alive)
         if line ~= last_line then
             log(line)
             last_line = line
         end
 
         if entity and is_dead(entity, seen_alive) then
-            end_tracking('%s has died; tracking stopped.':format(mob.Name))
+            end_tracking('%s has died; tracking stopped.':format(label(mob)))
             return
         end
 
         if windower.ffxi.wide_scan_get_tracking_info() then
             seen_tracking = true
         elseif seen_tracking then
-            end_tracking('Lost track of %s (dead, despawned or out of range).':format(mob.Name))
+            end_tracking('Lost track of %s (dead, despawned or out of range).':format(label(mob)))
             return
         end
 
@@ -510,7 +543,7 @@ end
 -- nothing (used to wait out a corpse after the monitor already reported it).
 local function watch(mob, quiet)
     if not quiet then
-        log('Waiting for %s to die or despawn.':format(mob.Name))
+        log('Waiting for %s to die or despawn.':format(label(mob)))
     end
     while true do
         coroutine.yield('retry', settings.status_delay)
@@ -521,7 +554,7 @@ local function watch(mob, quiet)
         end
         if not in_scan(mob.Index) then
             if not quiet then
-                log('%s is gone (dead or despawned).':format(mob.Name))
+                log('%s is gone (dead or despawned).':format(label(mob)))
             end
             return true
         end
@@ -534,6 +567,7 @@ end
 -- ends, or it leaves the scan results), the search either finishes or, with
 -- settings.loop, starts over for the same list.
 local function search_and_track(queries)
+    resolve_indices(queries)
     log('Searching for %s...':format(describe_all(queries)))
     local announced_wait = false
     -- True for the first scan of a search and of each looped restart, so
@@ -555,6 +589,8 @@ local function search_and_track(queries)
             return
         end
 
+        -- The entity table may have filled in since the last try.
+        resolve_indices(queries)
         local mob, done = track_first_match(queries)
         if mob then
             local gone
