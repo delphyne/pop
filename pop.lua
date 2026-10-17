@@ -6,21 +6,24 @@ _addon.command = 'pop'
 require('logger')
 local config = require('config')
 local packets = require('packets')
+local texts = require('texts')
 
 local defaults = {
-    -- Seconds between widescan attempts while the target has not been found.
-    delay = 1,
+    -- Seconds between widescans while searching, and before a looped search restarts.
+    scan_delay = 5,
+    -- Seconds between checks of a found mob: the status report and targeting
+    -- while tracked, and the rescans that wait for it to die or despawn.
+    status_delay = 1,
     -- Seconds to wait for the server to finish sending a widescan list before giving up.
     timeout = 5,
-    -- WAV file in the addon's sounds/ directory to play when a mob is tracked. Empty disables.
-    sound = 'found.wav',
-    -- When true, the sound is played when a mob is found. Set with //pop alert on|off.
-    alert = true,
+    -- Sound played when a mob is found. `enabled` is set with //pop alert on|off;
+    -- `file` is a WAV in the addon's sounds/ directory (empty disables).
+    alert = {enabled = true, file = 'found.wav'},
     -- When true, a found mob is widescan-tracked and its distance, HP and
     -- claim status reported. When false, the addon only scans and announces
     -- the find, then rescans until the mob is gone.
     track = true,
-    -- How the found mob is targeted (while in range) every delay seconds
+    -- How the found mob is targeted (while in range) on each status check
     -- until it is gone. Independent of track.
     --   'off'     - never
     --   'packet'  - inject the client-side Lock Target packet (exact entity)
@@ -29,14 +32,59 @@ local defaults = {
     -- When true, once a found mob is gone (dead or despawned) the whole search
     -- starts over for the same list of mobs. When false, the search is done.
     loop = true,
+    -- Whether the on-screen timer is shown at all. Set with //pop timer on|off.
+    show_timer = true,
+    -- On-screen timer counting up from the start of a search until a mob is
+    -- found. Drag it to move it; the position is saved. A negative position
+    -- means "not placed yet": centered horizontally, a third of the way down.
+    timer = {
+        pos = {x = -1, y = -1},
+        text = {size = 16, font = 'Consolas', red = 255, green = 255, blue = 255, alpha = 255},
+        bg = {red = 0, green = 0, blue = 0, alpha = 128, visible = true},
+        flags = {draggable = true, bold = true},
+        padding = 4,
+    },
+    -- Behavior of the timer when an expected pop time was given
+    -- (//pop <targets> <seconds>).
+    countdown = {
+        -- Beep played once per second during the alert window. `enabled` is
+        -- set with //pop countdown on|off.
+        sound = {enabled = true, file = 'countdown.wav'},
+        -- Seconds remaining at which the warn and alert colors take over.
+        thresholds = {warn = 15, alert = 5},
+        -- Timer colors: warn, then alert, then late at or after the expected time.
+        colors = {
+            warn = {red = 255, green = 220, blue = 0, alpha = 255},
+            alert = {red = 255, green = 140, blue = 0, alpha = 255},
+            late = {red = 255, green = 60, blue = 60, alpha = 255},
+        },
+    },
+    -- Color of the frozen timer after a find.
+    found_color = {red = 80, green = 160, blue = 255, alpha = 255},
 }
 local settings = config.load(defaults)
 
-local function play_found_sound()
-    if not settings.alert or settings.sound == '' then
+--------------------------------------------------------------------------------
+-- On-screen timer
+--------------------------------------------------------------------------------
+
+local timer_text = texts.new('${elapsed}', settings.timer, settings)
+-- os.time() when the current search started; nil when the timer is hidden.
+local timer_started
+-- True while the timer is counting; false once frozen at the find time.
+local timer_running = false
+-- Last whole second rendered, to avoid rewriting the text every frame.
+local timer_shown
+-- Seconds until the pop is expected, if the user gave one; nil otherwise.
+local timer_expected
+
+-- Play a sound block of the form {enabled = bool, file = 'name.wav'}.
+local function play_sound(sound)
+    if not sound.enabled or not sound.file or sound.file == '' then
         return
     end
-    local path = windower.addon_path .. 'sounds/' .. settings.sound
+    local file = sound.file
+    local path = windower.addon_path .. 'sounds/' .. file
     if windower.file_exists(path) then
         windower.play_sound(path)
     else
@@ -44,26 +92,169 @@ local function play_found_sound()
     end
 end
 
+local function format_elapsed(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor(seconds % 3600 / 60)
+    local s = seconds % 60
+    if h > 0 then
+        return '%d:%02d:%02d':format(h, m, s)
+    end
+    return '%02d:%02d':format(m, s)
+end
+
+-- Set the text color without touching the saved settings, so the configured
+-- color survives a settings save made while the timer is recolored.
+local timer_color
+local function set_timer_color(color)
+    if color == timer_color then
+        return
+    end
+    timer_color = color
+    windower.text.set_color(timer_text._name, color.alpha or settings.timer.text.alpha, color.red, color.green, color.blue)
+end
+
+-- Color for the running timer given seconds remaining (nil when no expectation):
+-- the configured text color, then warn, alert, and late as the thresholds pass.
+local function countdown_color(remaining)
+    local c = settings.countdown
+    if not remaining or remaining > c.thresholds.warn then
+        return settings.timer.text
+    elseif remaining > c.thresholds.alert then
+        return c.colors.warn
+    elseif remaining > 0 then
+        return c.colors.alert
+    end
+    return c.colors.late
+end
+
+local function render_timer(seconds)
+    timer_shown = seconds
+    if timer_expected then
+        timer_text.elapsed = '%s / %s':format(format_elapsed(seconds), format_elapsed(timer_expected))
+    else
+        timer_text.elapsed = format_elapsed(seconds)
+    end
+end
+
+-- Place the timer centered horizontally, a third of the way down the screen,
+-- unless the user has already dragged it somewhere (position saved).
+local function place_timer()
+    if settings.timer.pos.x >= 0 and settings.timer.pos.y >= 0 then
+        return
+    end
+    local screen = windower.get_windower_settings()
+    local width = timer_text:extents()
+    timer_text:pos(math.floor(screen.x_res / 2 - width / 2), math.floor(screen.y_res / 3))
+end
+
+-- Seconds the frozen (found) time stays on screen before hiding.
+local FOUND_DISPLAY_SECONDS = 5
+-- Bumped on every start/freeze so a stale hide timer does nothing.
+local timer_serial = 0
+
+-- Start counting from zero. `expected` is the seconds until the pop is
+-- expected, or nil for a plain count-up.
+local function timer_start(expected)
+    timer_serial = timer_serial + 1
+    timer_started = os.time()
+    timer_expected = expected
+    timer_running = true
+    render_timer(0)
+    set_timer_color(countdown_color(expected))
+    if settings.show_timer then
+        place_timer()
+        timer_text:show()
+    end
+end
+
+-- Show or hide the timer immediately, if a search is active, to match the setting.
+local function timer_apply_visibility()
+    if settings.show_timer and timer_started then
+        place_timer()
+        timer_text:show()
+    else
+        timer_text:hide()
+    end
+end
+
+-- Forget the saved position so the timer is auto-centered again.
+local function timer_reset_position()
+    settings.timer.pos.x = -1
+    settings.timer.pos.y = -1
+    config.save(settings)
+    if timer_started and settings.show_timer then
+        place_timer()
+    end
+end
+
+-- Stop counting, turn blue, and hide after FOUND_DISPLAY_SECONDS.
+local function timer_freeze()
+    if timer_started then
+        render_timer(os.time() - timer_started)
+    end
+    timer_running = false
+    set_timer_color(settings.found_color)
+
+    timer_serial = timer_serial + 1
+    local serial = timer_serial
+    coroutine.schedule(function()
+        if serial == timer_serial then
+            timer_text:hide()
+        end
+    end, FOUND_DISPLAY_SECONDS)
+end
+
+local function timer_hide()
+    timer_running = false
+    timer_started = nil
+    timer_text:hide()
+end
+
+windower.register_event('prerender', function()
+    if not timer_running then
+        return
+    end
+    local seconds = os.time() - timer_started
+    if seconds == timer_shown then
+        return
+    end
+    render_timer(seconds)
+
+    if timer_expected then
+        local remaining = timer_expected - seconds
+        set_timer_color(countdown_color(remaining))
+        -- One beep per second through the alert window. Nothing once the
+        -- pop is late (remaining <= 0); a find stops the timer, so nothing
+        -- on or after the second the mob popped either.
+        local c = settings.countdown
+        if remaining > 0 and remaining <= c.thresholds.alert then
+            play_sound(c.sound)
+        end
+    end
+end)
+
+local function play_found_sound()
+    play_sound(settings.alert)
+end
+
 local help_text = [[pop usage:
-    //pop 0x<index>   - Widescan for the mob with the given hex index and track it, e.g. //pop 0x00f8
-    //pop <name>      - Widescan for the mob by name and track it, e.g. //pop "Valkurm Emperor"
-                        Wildcards are supported, e.g. //pop valkurm* or //pop *emperor
-                        Quote names containing spaces.
-    //pop <a> <b> ... - Track the first of several mobs found, checked in the order given,
-                        e.g. //pop "Valkurm Emperor" 0x00f8 *hare
-                        Scanning repeats every <delay> seconds until a mob is found or stopped.
-    //pop delay [n]   - Show or set the seconds between scans.
-    //pop timeout [n] - Show or set the seconds to wait for a scan to complete.
-    //pop track [on|off] - Show or set whether a found mob is widescan-tracked with its
-                        distance, HP and claim reported on change (on), or only announced (off).
-    //pop target [off|packet|command] - Show or set how a found mob is targeted (when in
-                        range) every <delay> seconds until it is gone. Independent of track.
-                        packet injects a client-side lock-on; command sends /target <name>.
-    //pop loop [on|off] - Show or set whether, after a found mob dies or despawns,
-                        the search restarts for the same list (on) or finishes (off).
-    //pop alert [on|off] - Show or set whether a sound is played when a mob is found.
-    //pop stop        - Stop searching/tracking.
-    //pop help        - Show this text.]]
+  //pop <mob1> [<mob2> ... <mobN>] [countdown]
+    mob: a 0x-prefixed hex index (0x00f8) or a name; names take * wildcards and need
+         quotes if they contain spaces. Several mobs are checked in order; first found wins.
+    countdown: expected seconds until the pop. The timer changes color as it nears and
+         beeps through the last few seconds.
+  //pop stop              Stop searching, tracking and targeting.
+  //pop help              Show this text.
+Settings (name alone shows the value; add a value to set it):
+  scan_delay <n>          Seconds between widescans while searching (default 5).
+  status_delay <n>        Seconds between checks of a found mob (default 1).
+  timeout <n>             Seconds to wait for a widescan before giving up (default 5).
+  track on|off            Widescan-track the found mob and report distance/HP/claim.
+  target off|packet|command  Target the mob in range: lock-on packet, or /target.
+  loop on|off             Search again after the found mob dies or despawns.
+  timer on|off|reset      Show the on-screen timer; reset re-centers it.
+  alert on|off            Chime when a mob is found.
+  countdown on|off        Beep through the last seconds before an expected pop.]]
 
 -- Mobs reported by the server during the current widescan (incoming 0x0F4).
 local scan_list = {}
@@ -84,7 +275,7 @@ local tracked_pos
 --
 -- The routine yields one of two signals:
 --   'scan'  - a widescan was requested; resume when the result list is complete
---   'retry' - wait settings.delay, then resume (rescan, or re-check the tracked mob)
+--   'retry', seconds - wait that long, then resume (rescan, or re-check the tracked mob)
 -- It is resumed with 'results' when the list arrived, or 'timeout' if it did not.
 --------------------------------------------------------------------------------
 
@@ -149,6 +340,7 @@ local function track_first_match(queries)
             else
                 log('Found: %s [0x%04X]':format(found[1].Name, found[1].Index))
             end
+            timer_freeze()
             play_found_sound()
             return found[1]
         elseif #found > 1 then
@@ -159,6 +351,7 @@ local function track_first_match(queries)
             for _, mob in ipairs(found) do
                 log('- %-16s [0x%04X]':format(mob.Name, mob.Index))
             end
+            timer_hide()
             return nil, true
         end
     end
@@ -263,7 +456,7 @@ local function end_tracking(reason)
 end
 
 -- Runs inside the tracker coroutine after a mob has been widescan-tracked:
--- report status changes (and target it, if enabled) every settings.delay
+-- report status changes (and target it, if enabled) every settings.status_delay
 -- seconds. Returns when the mob dies or the client drops the track (the mob
 -- died or despawned out of entity range, or the track was otherwise lost).
 local function monitor(mob)
@@ -298,7 +491,7 @@ local function monitor(mob)
         end
 
         target_mob(mob.Index)
-        coroutine.yield('retry')
+        coroutine.yield('retry', settings.status_delay)
     end
 end
 
@@ -311,8 +504,8 @@ local function in_scan(index)
     return false
 end
 
--- Track-off counterpart of monitor: rescan every settings.delay seconds and
--- return once the mob has left the widescan results (dead or despawned).
+-- Track-off counterpart of monitor: rescan every settings.status_delay seconds
+-- and return once the mob has left the widescan results (dead or despawned).
 -- Returns false if a scan timed out, so the caller stops. With `quiet`, logs
 -- nothing (used to wait out a corpse after the monitor already reported it).
 local function watch(mob, quiet)
@@ -320,7 +513,7 @@ local function watch(mob, quiet)
         log('Waiting for %s to die or despawn.':format(mob.Name))
     end
     while true do
-        coroutine.yield('retry')
+        coroutine.yield('retry', settings.status_delay)
         request_scan()
         if coroutine.yield('scan') == 'timeout' then
             error('Scan timed out after %g seconds.':format(settings.timeout))
@@ -343,13 +536,22 @@ end
 local function search_and_track(queries)
     log('Searching for %s...':format(describe_all(queries)))
     local announced_wait = false
+    -- True for the first scan of a search and of each looped restart, so
+    -- those scan immediately instead of waiting scan_delay.
+    local scan_now = true
 
     while true do
+        if not scan_now then
+            coroutine.yield('retry', settings.scan_delay)
+        end
+        scan_now = false
+
         request_scan()
         local outcome = coroutine.yield('scan')
 
         if outcome == 'timeout' then
             error('Scan timed out after %g seconds.':format(settings.timeout))
+            timer_hide()
             return
         end
 
@@ -365,20 +567,23 @@ local function search_and_track(queries)
             else
                 gone = watch(mob)
             end
-            if not gone or not settings.loop then
+            if not gone then
+                timer_hide()
+                return
+            elseif not settings.loop then
                 return
             end
-            log('Looping: searching for %s again in %gs.':format(describe_all(queries), settings.delay))
+            log('Looping: searching for %s again.':format(describe_all(queries)))
+            timer_start(queries.expected)
             announced_wait = false
+            scan_now = true
         elseif done then
             return
         elseif not announced_wait then
             local what = #queries == 1 and describe(queries[1]) or 'None of the targets'
-            log('%s not up yet; rescanning every %gs until found. //pop stop to cancel.':format(what, settings.delay))
+            log('%s not up yet; rescanning every %gs until found. //pop stop to cancel.':format(what, settings.scan_delay))
             announced_wait = true
         end
-
-        coroutine.yield('retry')
     end
 end
 
@@ -393,7 +598,7 @@ local function resume_tracker(co, ...)
         return
     end
 
-    local ok, signal = coroutine.resume(co, ...)
+    local ok, signal, wait = coroutine.resume(co, ...)
     if not ok then
         tracker = nil
         error(signal)
@@ -413,7 +618,7 @@ local function resume_tracker(co, ...)
     elseif signal == 'retry' then
         coroutine.schedule(function()
             resume_tracker(co)
-        end, settings.delay)
+        end, wait)
     end
 end
 
@@ -423,6 +628,7 @@ local function start_tracking(queries)
     end
     tracked_index = nil
     tracked_pos = nil
+    timer_start(queries.expected)
     tracker = coroutine.create(search_and_track)
     resume_tracker(tracker, queries)
 end
@@ -431,6 +637,7 @@ local function stop_tracking()
     tracker = nil
     tracked_index = nil
     tracked_pos = nil
+    timer_hide()
     windower.ffxi.wide_scan_stop_tracking()
 end
 
@@ -519,24 +726,38 @@ local function parse_bool(word)
 end
 
 -- Boolean settings adjustable from the command line: key -> description.
+-- Boolean settings adjustable from the command line:
+-- command -> {description, path of keys into settings}.
 local bool_settings = {
-    track = 'Tracking after a find',
-    loop = 'Looping after a find is gone',
-    alert = 'Sound on a find',
+    track = {'Tracking after a find', {'track'}},
+    loop = {'Looping after a find is gone', {'loop'}},
+    alert = {'Sound on a find', {'alert', 'enabled'}},
+    countdown = {'Countdown beeps before an expected pop', {'countdown', 'sound', 'enabled'}},
 }
 
+-- Returns the table holding the setting and the key within it.
+local function resolve(path)
+    local t = settings
+    for i = 1, #path - 1 do
+        t = t[path[i]]
+    end
+    return t, path[#path]
+end
+
 -- Show the setting, or set and save it when a value is given.
-local function show_or_set_bool(key, value)
+local function show_or_set_bool(cmd, value)
+    local description, path = unpack(bool_settings[cmd])
+    local t, key = resolve(path)
     if value then
         local flag = parse_bool(value)
         if flag == nil then
-            error('%s expects on/off (or true/false, yes/no, 1/0).':format(key))
+            error('%s expects on/off (or true/false, yes/no, 1/0).':format(cmd))
             return
         end
-        settings[key] = flag
+        t[key] = flag
         config.save(settings)
     end
-    log('%s: %s':format(bool_settings[key], settings[key] and 'on' or 'off'))
+    log('%s: %s':format(description, t[key] and 'on' or 'off'))
 end
 
 -- Multiple-choice settings: key -> {description, allowed values in order}.
@@ -565,7 +786,8 @@ end
 
 -- Numeric settings adjustable from the command line: key -> description.
 local numeric_settings = {
-    delay = 'Delay between scans',
+    scan_delay = 'Delay between widescans',
+    status_delay = 'Delay between status checks',
     timeout = 'Scan timeout',
 }
 
@@ -588,7 +810,10 @@ windower.register_event('addon command', function(...)
     local cmd = args[1] and args[1]:lower() or 'help'
 
     if cmd == 'help' then
-        print(help_text)
+        -- One add_to_chat per line; the chat log does not render embedded newlines.
+        for line in help_text:gmatch('[^\n]+') do
+            windower.add_to_chat(207, line)
+        end
     elseif cmd == 'stop' or cmd == 'end' then
         stop_tracking()
         log('Stopped.')
@@ -598,11 +823,38 @@ windower.register_event('addon command', function(...)
         show_or_set_bool(cmd, args[2])
     elseif choice_settings[cmd] then
         show_or_set_choice(cmd, args[2])
+    elseif cmd == 'timer' then
+        local value = args[2] and args[2]:lower()
+        if value == 'reset' then
+            timer_reset_position()
+            log('Timer position reset.')
+        elseif value then
+            local flag = parse_bool(value)
+            if flag == nil then
+                error('timer expects on, off or reset.')
+                return
+            end
+            settings.show_timer = flag
+            config.save(settings)
+            timer_apply_visibility()
+        end
+        log('Timer: %s':format(settings.show_timer and 'on' or 'off'))
     else
+        -- A trailing whole number is the expected seconds until the pop, used
+        -- by the on-screen timer for its countdown colors and beeps.
+        local expected
+        if #args > 1 and args[#args]:match('^%d+$') then
+            expected = tonumber(table.remove(args))
+            if expected <= 0 then
+                error('Expected pop time must be a positive number of seconds.')
+                return
+            end
+        end
+
         -- Each remaining argument is a target, in priority order. An argument with
         -- the 0x prefix is an index; anything else is a (wildcard) name. Names
         -- with spaces must be quoted so the command parser keeps them together.
-        local queries = {}
+        local queries = {expected = expected}
         for i, arg in ipairs(args) do
             local index = parse_index(arg)
             queries[i] = index and {index = index} or {name = arg:lower()}
