@@ -111,7 +111,9 @@ one.
 | `//pop timeout [n]` | seconds | `5` | How long to wait for the server to finish sending a Wide Scan list before the search ends with an error. |
 | `//pop track [on\|off]` | boolean | `on` | Wide Scan track the found mob and report its distance, HP, and claim whenever they change. When off, pop only announces the find and keeps scanning until the mob is gone. |
 | `//pop target [off\|packet\|command]` | choice | `off` | How to put your cursor on the mob once it is in range. `command` sends `/target <name>`; `packet` injects the client-side lock-on packet, which selects the exact entity. Independent of `track`. Turning this off also turns `claim` off. |
-| `//pop claim [off\|<name>]` | spell or ability name | `off` | Once the mob is targeted, use this spell or job ability on it while it is unclaimed. The name is looked up in the game's spell and ability lists, so `dia` and `"Dia"` both work; the right slash command is picked for you. Refused while `target` is `off`. |
+| `//pop claim [off\|<name>]` | spell or ability name | `off` | Once the mob is targeted, use this spell or job ability on it while it is unclaimed. The name is looked up in the game's spell and ability lists, so `dia` and `"Dia"` both work; the right slash command is picked for you. Refused while `target` is `off`, and refused when `claim_range` is `-1` but the action's range is not known, in which case set `claim_range` and try again. |
+| `//pop claim_range [n\|-1]` | yalms | `-1` | How close the mob must be before pop tries to claim it, before model sizes. `-1` uses the action's own range from the game resources; refused when the current action has none. With no argument, prints the reach in use. |
+| `//pop claim_delay [n]` | seconds | `5` | Time to wait after a claim attempt before trying again, so a cast in progress or a miss is not spammed. |
 | `//pop loop [on\|off]` | boolean | `on` | After the found mob dies or despawns, start the whole search over for the same list. When off, pop is done after one spawn. |
 
 ### Display and sound settings
@@ -142,8 +144,8 @@ after editing it by hand.
 | `track` | boolean | `true` | See `//pop track`. |
 | `target` | string | `off` | `off`, `packet`, or `command`. See `//pop target`. |
 | `claim.action` | string | `off` | `off`, or the English name of a spell or job ability. See `//pop claim`. Ignored, with a warning on load, if `target` is `off` or the name is unknown. |
-| `claim.range` | number | `20` | Only try to claim while the mob is within this many yalms. Most spells reach about 20; many abilities less. |
-| `claim.retry` | number | `5` | Seconds to wait after a claim attempt before trying again, so a cast in progress or a miss is not spammed. |
+| `claim.range` | number | `-1` | See `//pop claim_range`. If this is `-1` and the action's range is not known, claiming is disabled with a warning on load. |
+| `claim.delay` | number | `5` | See `//pop claim_delay`. |
 | `loop` | boolean | `true` | See `//pop loop`. |
 
 ### Display and sound
@@ -185,10 +187,17 @@ A color is a block with `red`, `green`, `blue`, and `alpha`, each 0 to 255.
   client a lock-on packet locally and sends nothing to the server.
 - Claiming types the action into the chat line as `/ma "Dia" <t>` or
   `/ja "Provoke" <t>`, exactly as you would. It only fires while the mob is
-  your current target, alive, unclaimed, and inside `claim.range`, and never
-  more than once per `claim.retry` seconds. pop does not check that your
-  current job can use the action or that it is off recast; the game reports
-  those as usual.
+  your current target, alive, unclaimed, and within reach, and never more
+  than once per `claim_delay` seconds. pop does not check that your current
+  job can use the action or that it is off recast; the game reports those as
+  usual.
+- With `claim_range` at `-1`, the reach comes from the action's `range` code
+  in Windower's spell and ability resources, converted to yalms with the same
+  measured multipliers the DistancePlus addon uses, plus your model size and
+  the mob's. Most spells work out to about 20 yalms; melee-range abilities to
+  3 to 6. Some actions carry no usable code; those need an explicit
+  `claim_range`. `//pop claim` or `//pop claim_range` with no argument prints
+  the reach in use.
 - The chime and beep are small generated WAVs. Replace the files in `sounds/`,
   or drop in others and point `alert.file` or `countdown.sound.file` at them,
   if you prefer different noises.

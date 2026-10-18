@@ -33,9 +33,10 @@ local defaults = {
     -- How the found mob is claimed once it is targeted and unclaimed. Needs
     -- target on; //pop claim refuses otherwise.
     --   action - 'off', or the English name of a spell or job ability to use on it
-    --   range  - only try while the mob is within this many yalms
-    --   retry  - seconds to wait after an attempt before trying again
-    claim = {action = 'off', range = 20, retry = 5},
+    --   range  - yalms (before model sizes) to try from, or -1 to use the
+    --            action's own range from the game resources
+    --   delay  - seconds to wait after an attempt before trying again
+    claim = {action = 'off', range = -1, delay = 5},
     -- When true, once a found mob is gone (dead or despawned) the whole search
     -- starts over for the same list of mobs. When false, the search is done.
     loop = true,
@@ -246,24 +247,26 @@ end
 
 local help_text = [[pop usage:
   //pop <mob1> [<mob2> ... <mobN>] [countdown]
-    mob: a 0x-prefixed hex index (0x00f8) or a name; names take * wildcards and need
-         quotes if they contain spaces. Several mobs are checked in order; first found wins.
-    countdown: expected seconds until the pop. The timer changes color as it nears and
-         beeps through the last few seconds.
-  //pop stop              Stop searching, tracking and targeting.
-  //pop help              Show this text.
+    mob: a 0x-prefixed hex index (0x00f8)
+         or
+         a name with wildcards (*alk*)
+    countdown: expected respawn time in seconds
+    mobs are found in order, and the first listed mob wins
+  //pop stop              Stop searching, tracking and targeting
+  //pop help              Show this text
 Settings (name alone shows the value; add a value to set it):
-  scan_delay <n>          Seconds between widescans while searching (default 5).
-  status_delay <n>        Seconds between checks of a found mob (default 1).
-  timeout <n>             Seconds to wait for a widescan before giving up (default 5).
-  track on|off            Widescan-track the found mob and report distance/HP/claim.
-  target off|packet|command  Target the mob in range: lock-on packet, or /target.
-  claim off|<name>        Use that spell or job ability on the targeted mob while it
-                          is unclaimed (needs target on).
-  loop on|off             Search again after the found mob dies or despawns.
-  timer on|off|reset      Show the on-screen timer; reset re-centers it.
-  alert on|off            Chime when a mob is found.
-  countdown on|off        Beep through the last seconds before an expected pop.]]
+  scan_delay <n>             Seconds between scans (default 5)
+  status_delay <n>           Seconds between checks of a found mob (default 1)
+  timeout <n>                Seconds to wait for a widescan to finish (default 5)
+  track on|off               Track the mob and report distance/HP/claim
+  target off|packet|command  Target the mob in if in range
+  claim off|<name>           Use that spell or job ability to attempt to claim
+  claim_range <n>|-1         Yalms to claim from; -1 uses the ability's own range
+  claim_delay <n>            Seconds between claim attempts (default 5)
+  loop on|off               Search again after the found mob dies or despawns
+  timer on|off|reset         Show an on-screen timer; reset re-centers it
+  alert on|off               Chime when a mob is found
+  countdown on|off           Beep when respawn is near]]
 
 -- Mobs reported by the server during the current widescan (incoming 0x0F4).
 local scan_list = {}
@@ -280,7 +283,7 @@ local tracked_index
 local tracked_pos
 -- Resource entry for settings.claim.action; nil when claiming is off.
 local claim_action
--- os.time() of the last claim attempt, so attempts are spaced claim.retry apart.
+-- os.time() of the last claim attempt, so attempts are spaced claim.delay apart.
 local last_claim_attempt = 0
 
 --------------------------------------------------------------------------------
@@ -371,6 +374,20 @@ local function describe_all(queries)
     return table.concat(parts, ', ')
 end
 
+-- The queries as an English list: 'A', 'A or B', 'A, B, or C'.
+local function describe_list(queries, conjunction)
+    local parts = {}
+    for i, query in ipairs(queries) do
+        parts[i] = describe(query)
+    end
+    if #parts <= 1 then
+        return parts[1] or ''
+    elseif #parts == 2 then
+        return '%s %s %s':format(parts[1], conjunction, parts[2])
+    end
+    return '%s, %s %s':format(table.concat(parts, ', ', 1, #parts - 1), conjunction, parts[#parts])
+end
+
 -- Check each query, in order, against the current scan results. Returns the
 -- tracked mob, or nil plus `true` when the search is over anyway (ambiguous).
 local function track_first_match(queries)
@@ -396,7 +413,7 @@ local function track_first_match(queries)
             -- picked up from an earlier single match no longer identifies it.
             -- Only name queries can get here; an index matches at most once.
             query.known = nil
-            log('Multiple matches for %s; retry with an index:':format(describe(query)))
+            log('Multiple matches found for %s; begin again using one of the following indices':format(describe(query)))
             table.sort(found, function(a, b)
                 return a.Index < b.Index
             end)
@@ -517,6 +534,46 @@ local function find_action(name)
     return nil
 end
 
+-- Yalms per unit of a resource entry's `range` code, as measured in game for
+-- the DistancePlus addon. An action reaches code * multiplier yalms plus both
+-- model sizes. Code 12 is the usual spell range, about 20 yalms; 2 to 4 are
+-- melee-ish. Self-targeted actions carry 0 and are not in the table.
+local RANGE_MULTIPLIER = {
+    [2] = 1.55, [3] = 1.490909, [4] = 1.44, [5] = 1.377778, [6] = 1.30,
+    [7] = 1.15, [8] = 1.25, [9] = 1.377778, [10] = 1.45, [11] = 1.454545,
+    [12] = 1.666667,
+}
+
+-- The action's own reach in yalms before model sizes, from its resource range
+-- code; nil when the code is missing or not in the table.
+local function action_reach(action)
+    local code = action and action.range
+    local multiplier = code and RANGE_MULTIPLIER[code]
+    return multiplier and code * multiplier or nil
+end
+
+-- Reach to claim from, in yalms before model sizes: settings.claim.range when
+-- it is not -1, else the action's own reach. Returns the reach (nil when
+-- neither is known) and where it came from: 'claim_range' or 'ability'.
+local function claim_reach()
+    if settings.claim.range >= 0 then
+        return settings.claim.range, 'claim_range'
+    end
+    local reach = action_reach(claim_action)
+    return reach, reach and 'ability' or nil
+end
+
+-- Human-readable reach in use, for the claim and claim_range commands.
+local function reach_text()
+    local reach, source = claim_reach()
+    if reach then
+        return '%.1f yalms plus model sizes (%s)':format(reach, source == 'ability' and "ability's own range" or 'claim_range')
+    elseif claim_action then
+        return 'unknown; set claim_range'
+    end
+    return "ability's own range"
+end
+
 -- Look up the configured claim action. Returns an error message when the
 -- setting cannot be used as it stands, in which case claiming is left off.
 local function resolve_claim_action()
@@ -528,16 +585,20 @@ local function resolve_claim_action()
     if settings.target == 'off' then
         return 'claim is set to %s but target is off; claiming disabled.':format(name)
     end
-    claim_action = find_action(name)
-    if not claim_action then
+    local action = find_action(name)
+    if not action then
         return 'No spell or job ability called "%s"; claiming disabled.':format(name)
     end
+    if settings.claim.range < 0 and not action_reach(action) then
+        return '%s has no known range and claim_range is -1; claiming disabled.':format(action.english)
+    end
+    claim_action = action
     return nil
 end
 
 -- Use the claim action on the mob, which must be the current target. Does
--- nothing while the mob is claimed (by anyone), dead, out of claim.range, or
--- within claim.retry seconds of the last attempt.
+-- nothing while the mob is claimed (by anyone), dead, beyond the action's
+-- reach, or within claim.delay seconds of the last attempt.
 local function claim_mob(index)
     if not claim_action then
         return
@@ -546,14 +607,20 @@ local function claim_mob(index)
     if not mob or not mob.valid_target or is_dead(mob) or mob.claim_id ~= 0 then
         return
     end
-    if math.sqrt(mob.distance) > settings.claim.range then
+    local reach = claim_reach()
+    if not reach then
         return
     end
-    if os.time() - last_claim_attempt < settings.claim.retry then
+    local me = windower.ffxi.get_mob_by_target('me')
+    reach = reach + (me and me.model_size or 0) + (mob.model_size or 0)
+    if math.sqrt(mob.distance) > reach then
+        return
+    end
+    if os.time() - last_claim_attempt < settings.claim.delay then
         return
     end
     last_claim_attempt = os.time()
-    log('Claiming %s with %s.':format(mob.name, claim_action.english))
+    log('Attempting to claim %s with %s.':format(mob.name, claim_action.english))
     windower.send_command('input %s "%s" <t>':format(claim_action.prefix, claim_action.english))
 end
 
@@ -699,8 +766,8 @@ local function search_and_track(queries)
         elseif done then
             return
         elseif not announced_wait then
-            local what = #queries == 1 and describe(queries[1]) or 'None of the targets'
-            log('%s not up yet; rescanning every %gs until found. //pop stop to cancel.':format(what, settings.scan_delay))
+            local what = #queries == 1 and describe(queries[1]) .. ' not found' or 'None of ' .. describe_list(queries, 'or') .. ' found'
+            log('%s, rescanning every %gs. //pop stop to cancel.':format(what, settings.scan_delay))
             announced_wait = true
         end
     end
@@ -849,7 +916,7 @@ end
 -- command -> {description, path of keys into settings}.
 local bool_settings = {
     track = {'Tracking after a find', {'track'}},
-    loop = {'Looping after a find is gone', {'loop'}},
+    loop = {'Resume after death or despawn', {'loop'}},
     alert = {'Sound on a find', {'alert', 'enabled'}},
     countdown = {'Countdown beeps before an expected pop', {'countdown', 'sound', 'enabled'}},
 }
@@ -927,38 +994,66 @@ local function show_or_set_claim(value)
                 error('No spell or job ability called "%s".':format(value))
                 return
             end
+            if settings.claim.range < 0 and not action_reach(action) then
+                error('%s has no known range. Set //pop claim_range <yalms> first, then try again.':format(action.english))
+                return
+            end
             settings.claim.action = action.english
             claim_action = action
         end
         config.save(settings)
     end
     if claim_action then
-        log('Claiming with: %s (%s), within %g yalms, retrying every %gs.':format(
-            claim_action.english, claim_action.prefix, settings.claim.range, settings.claim.retry))
+        log('Claiming with: %s (%s), reach %s, retrying every %gs.':format(
+            claim_action.english, claim_action.prefix, reach_text(), settings.claim.delay))
     else
         log('Claiming: off')
     end
 end
 
--- Numeric settings adjustable from the command line: key -> description.
+-- Show the claim range, or set and save it when a value is given: a positive
+-- number of yalms, or -1 to use the action's own range (refused when the
+-- current action has none).
+local function show_or_set_claim_range(value)
+    if value then
+        local number = tonumber(value)
+        if not number or not (number > 0 or number == -1) then
+            error("claim_range must be a positive number of yalms, or -1 for the ability's own range.")
+            return
+        end
+        if number == -1 and claim_action and not action_reach(claim_action) then
+            error('%s has no known range; claim_range needs a number of yalms.':format(claim_action.english))
+            return
+        end
+        settings.claim.range = number
+        config.save(settings)
+    end
+    log('Claim range: %s':format(reach_text()))
+end
+
+-- Numeric settings adjustable from the command line, all positive seconds:
+-- command -> {description, path of keys into settings}.
 local numeric_settings = {
-    scan_delay = 'Delay between widescans',
-    status_delay = 'Delay between status checks',
-    timeout = 'Scan timeout',
+    scan_delay = {'Delay between widescans', {'scan_delay'}},
+    status_delay = {'Delay between status checks', {'status_delay'}},
+    timeout = {'Scan timeout', {'timeout'}},
+    claim_delay = {'Delay between claim attempts', {'claim', 'delay'}},
 }
 
 -- Show the setting, or set and save it when a value is given.
-local function show_or_set(key, value)
+local function show_or_set(cmd, value)
+    local description, path = unpack(numeric_settings[cmd])
+    local t, key = resolve(path)
     if value then
         local number = tonumber(value)
         if not number or number <= 0 then
-            error('%s must be a positive number of seconds.':format(numeric_settings[key]))
+            error('%s must be a positive number of seconds.':format(description))
             return
         end
-        settings[key] = number
+        t[key] = number
         config.save(settings)
     end
-    log('%s: %gs':format(numeric_settings[key], settings[key]))
+    log('%s: %gs':format(description, t[key]))
 end
 
 windower.register_event('addon command', function(...)
@@ -982,6 +1077,8 @@ windower.register_event('addon command', function(...)
     elseif cmd == 'claim' then
         -- Join the rest so an unquoted multi-word name still works.
         show_or_set_claim(args[2] and table.concat(args, ' ', 2))
+    elseif cmd == 'claim_range' then
+        show_or_set_claim_range(args[2])
     elseif cmd == 'timer' then
         local value = args[2] and args[2]:lower()
         if value == 'reset' then
